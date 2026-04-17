@@ -135,18 +135,31 @@ trap 'rm -f "$CONTEXT_FILE" "${CONTEXT_FILE%.ctx}"' EXIT
     fi
     echo
 
-    echo "--- installed skills (names only) ---"
-    # Primary location: ~/.claude/skills/ (directories). Secondary: marketplace
-    # plugins under ~/.claude/plugins/marketplaces/*/. We list both.
+    echo "--- installed skills (with descriptions) ---"
+    # For each skill dir at ~/.claude/skills/<name>/, extract the YAML
+    # frontmatter from SKILL.md (description, argument-hint, allowed-tools).
+    # That tells the daemon what each skill actually *does*, not just its name.
     if [ -d "$HOME/.claude/skills" ]; then
         echo "## ~/.claude/skills/ (custom/personal)"
-        find "$HOME/.claude/skills" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; 2>/dev/null | sort || echo "(empty)"
+        for dir in "$HOME/.claude/skills"/*/; do
+            [ -d "$dir" ] || continue
+            name="$(basename "$dir")"
+            echo "### /$name"
+            if [ -f "$dir/SKILL.md" ]; then
+                # Extract frontmatter (between the first pair of ---). Max 15 lines.
+                awk '/^---$/{if(++n==2) exit; next} n==1{print}' "$dir/SKILL.md" 2>/dev/null | head -15
+                # Plus the first body line after frontmatter (usually the H1 or intent).
+                awk 'f && NF {print; exit} /^---$/{if(++n==2)f=1}' "$dir/SKILL.md" 2>/dev/null
+            else
+                echo "(no SKILL.md)"
+            fi
+            echo
+        done
     fi
     if [ -d "$HOME/.claude/plugins/marketplaces" ]; then
-        # Filter out Claude-internal metadata dirs (.claude-plugin, etc.)
         MARKETPLACE_OUT=$(find "$HOME/.claude/plugins/marketplaces" -maxdepth 2 -mindepth 2 -type d -exec basename {} \; 2>/dev/null | grep -v '^\.' | sort)
         if [ -n "$MARKETPLACE_OUT" ]; then
-            echo "## ~/.claude/plugins/marketplaces/ (installed plugins)"
+            echo "## ~/.claude/plugins/marketplaces/ (installed plugins, names only)"
             echo "$MARKETPLACE_OUT"
         fi
     fi
@@ -171,23 +184,37 @@ trap 'rm -f "$CONTEXT_FILE" "${CONTEXT_FILE%.ctx}"' EXIT
     fi
     echo
 
-    echo "--- MCP servers configured (from settings files) ---"
-    # Extract mcpServers keys from settings.json and settings.local.json if they parse.
-    for f in "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json"; do
-        if [ -f "$f" ]; then
-            echo "### $(basename "$f")"
-            # Best-effort: python -c 'json' for robust parse; fall back to grep.
-            python3 -c "
-import json, sys
-try:
-    d = json.load(open('$f'))
-    servers = list((d.get('mcpServers') or {}).keys())
-    print('  mcp: ' + (', '.join(servers) if servers else '(none)'))
-except Exception as e:
-    print(f'  (could not parse: {e})')
-" 2>/dev/null || grep -o '"mcpServers"' "$f" || true
-        fi
+    echo "--- MCP servers (live status from 'claude mcp list') ---"
+    # Run the CLI's canonical mcp list. Shows transport (stdio/HTTP/SSE),
+    # the command or URL, and the current health (Connected / Failed / Needs auth).
+    # This is the source of truth — settings.json is stale or partial.
+    # Use gtimeout if available (GNU coreutils via Homebrew), else run unbounded.
+    # `claude mcp list` is fast in practice; the guard is defense-in-depth.
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout 15 "$CLAUDE_BIN" mcp list 2>&1 | grep -v "^Checking" || echo "(claude mcp list failed or unavailable)"
+    else
+        "$CLAUDE_BIN" mcp list 2>&1 | grep -v "^Checking" || echo "(claude mcp list failed or unavailable)"
+    fi
+    echo
+
+    echo "--- last 14 days of digests (full content) ---"
+    # Inline the actual content of recent daily digests, newest first. This
+    # lets Claude see what it already told the user — to avoid repeating
+    # recommendations, to surface unresolved ones, and to write callback
+    # emails when appropriate. Ordered newest -> oldest.
+    COUNT=0
+    for md in $(find "$INSTALL_DIR" -maxdepth 1 -type f -name '????-??-??.md' 2>/dev/null | sort -r); do
+        [ -f "$md" ] || continue
+        NAME="$(basename "$md")"
+        # Skip today's file — we haven't written it yet this run.
+        [ "$NAME" = "$TODAY.md" ] && continue
+        echo "### $NAME"
+        cat "$md"
+        echo
+        COUNT=$((COUNT + 1))
+        [ "$COUNT" -ge 14 ] && break
     done
+    [ "$COUNT" -eq 0 ] && echo "(no previous digests — this may be the first run)"
     echo
 
     echo "=== END USER CONTEXT BUNDLE ==="
@@ -268,33 +295,49 @@ while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
 done
 
 # ---- STEP 5: Verify digest produced ----
-if [ -f "$INSTALL_DIR/$TODAY.md" ]; then
-    echo "SUCCESS: Digest written to $INSTALL_DIR/$TODAY.md"
+# Expect Claude to produce both a markdown file and a JSON file. The JSON
+# drives the email render; the markdown is the durable human archive.
+JSON_FILE="$INSTALL_DIR/$TODAY.json"
+MD_FILE="$INSTALL_DIR/$TODAY.md"
+if [ -f "$MD_FILE" ] && [ -f "$JSON_FILE" ]; then
+    echo "SUCCESS: Markdown digest at $MD_FILE"
+    echo "SUCCESS: JSON digest at $JSON_FILE"
+elif [ -f "$MD_FILE" ] && [ ! -f "$JSON_FILE" ]; then
+    echo "ERROR: Markdown produced but JSON missing. Renderer can't build the email."
+    echo "ERROR: Claude may not have written to the expected path."
+    exit 1
 else
-    echo "ERROR: Digest file $INSTALL_DIR/$TODAY.md was not produced after $MAX_ATTEMPTS attempts."
+    echo "ERROR: Digest files not produced after $MAX_ATTEMPTS attempts."
     echo "ERROR: Last claude -p exit code: $CLAUDE_EXIT"
-    echo "ERROR: Job failing with exit 1 so launchd records the failure."
     exit 1
 fi
 
 INSTALLED_AFTER=$("$CLAUDE_BIN" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 echo "INFO: Installed version (after): ${INSTALLED_AFTER:-UNKNOWN}"
 
-# ---- STEP 6: Send the .eml via msmtp ----
+# ---- STEP 6: Render JSON -> multipart MIME .eml ----
 EML_FILE="$EMAILS_DIR/$TODAY.eml"
-if [ -f "$EML_FILE" ]; then
-    if command -v msmtp >/dev/null 2>&1; then
-        if msmtp -a gmail -t < "$EML_FILE"; then
-            echo "INFO: Email sent via msmtp (gmail account)"
-        else
-            MSMTP_EXIT=$?
-            echo "WARNING: msmtp send failed (exit $MSMTP_EXIT). .eml still at $EML_FILE — see $LOG_DIR/msmtp.log"
-        fi
+RENDER_SCRIPT="$INSTALL_DIR/bin/render-email.py"
+if [ ! -f "$RENDER_SCRIPT" ]; then
+    echo "ERROR: Renderer missing at $RENDER_SCRIPT"
+    exit 1
+fi
+if ! python3 "$RENDER_SCRIPT" "$JSON_FILE" "$EML_FILE"; then
+    echo "ERROR: render-email.py failed on $JSON_FILE"
+    exit 1
+fi
+echo "INFO: Rendered multipart MIME email to $EML_FILE"
+
+# ---- STEP 7: Send via msmtp ----
+if command -v msmtp >/dev/null 2>&1; then
+    if msmtp -a gmail -t < "$EML_FILE"; then
+        echo "INFO: Email sent via msmtp (gmail account)"
     else
-        echo "INFO: msmtp not installed; .eml at $EML_FILE for manual open"
+        MSMTP_EXIT=$?
+        echo "WARNING: msmtp send failed (exit $MSMTP_EXIT). .eml at $EML_FILE — see $LOG_DIR/msmtp.log"
     fi
 else
-    echo "WARNING: No .eml file at $EML_FILE — Claude skipped email generation"
+    echo "WARNING: msmtp not installed; .eml at $EML_FILE for manual send"
 fi
 
 # ---- STEP 7: Log rotation ----
