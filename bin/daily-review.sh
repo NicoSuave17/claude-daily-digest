@@ -101,25 +101,136 @@ if [ -z "$INSTALLED_VERSION" ]; then
 fi
 echo "INFO: Installed version (before): $INSTALLED_VERSION"
 
-# ---- STEP 3: Render prompt template ----
-# Simple substitution. Values come from config + runtime. The template itself
-# can be edited by the user to customize how Claude behaves — see templates/prompt.tpl.
+# ---- STEP 3a: Collect Tier 2 context (whitelist only) ----
+# We inline a small, stable set of files so the digest knows the user's actual
+# setup. Not dynamic enough to leak things they didn't plan to share. Each
+# block is optional — missing files just mean the corresponding section is empty.
+CONTEXT_FILE="$(mktemp -t claude-digest-context.XXXXXX)"
+trap 'rm -f "$CONTEXT_FILE" "${CONTEXT_FILE%.ctx}"' EXIT
+
+{
+    echo "=== BEGIN USER CONTEXT BUNDLE ==="
+    echo "# The following sections describe the user's current Claude Code setup."
+    echo "# Use them to ground the 'why it matters' and 'features worth trying' sections."
+    echo "# Anything marked '(not found)' means that file/directory doesn't exist; skip it."
+    echo
+
+    echo "--- global CLAUDE.md (user's operating principles) ---"
+    if [ -f "$HOME/.claude/CLAUDE.md" ]; then
+        cat "$HOME/.claude/CLAUDE.md"
+    else
+        echo "(not found)"
+    fi
+    echo
+
+    echo "--- global rules (user's explicit behavioral rules) ---"
+    if compgen -G "$HOME/.claude/rules/*.md" > /dev/null; then
+        for f in "$HOME/.claude/rules"/*.md; do
+            echo "### $(basename "$f")"
+            cat "$f"
+            echo
+        done
+    else
+        echo "(no rules/ directory or empty)"
+    fi
+    echo
+
+    echo "--- installed skills (names only) ---"
+    # Primary location: ~/.claude/skills/ (directories). Secondary: marketplace
+    # plugins under ~/.claude/plugins/marketplaces/*/. We list both.
+    if [ -d "$HOME/.claude/skills" ]; then
+        echo "## ~/.claude/skills/ (custom/personal)"
+        find "$HOME/.claude/skills" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; 2>/dev/null | sort || echo "(empty)"
+    fi
+    if [ -d "$HOME/.claude/plugins/marketplaces" ]; then
+        # Filter out Claude-internal metadata dirs (.claude-plugin, etc.)
+        MARKETPLACE_OUT=$(find "$HOME/.claude/plugins/marketplaces" -maxdepth 2 -mindepth 2 -type d -exec basename {} \; 2>/dev/null | grep -v '^\.' | sort)
+        if [ -n "$MARKETPLACE_OUT" ]; then
+            echo "## ~/.claude/plugins/marketplaces/ (installed plugins)"
+            echo "$MARKETPLACE_OUT"
+        fi
+    fi
+    if [ ! -d "$HOME/.claude/skills" ] && [ ! -d "$HOME/.claude/plugins" ]; then
+        echo "(no skills/ or plugins/ directory)"
+    fi
+    echo
+
+    echo "--- Context OS navigation index (if user maintains one) ---"
+    if [ -f "$HOME/.claude/context-os/CONTEXT-OS.md" ]; then
+        cat "$HOME/.claude/context-os/CONTEXT-OS.md"
+    else
+        echo "(no Context OS)"
+    fi
+    echo
+
+    echo "--- top-level projects (folder names only; for topical correlation) ---"
+    if [ -d "$HOME/Desktop/Projects" ]; then
+        ls -1 "$HOME/Desktop/Projects" 2>/dev/null | head -100
+    else
+        echo "(no ~/Desktop/Projects directory)"
+    fi
+    echo
+
+    echo "--- MCP servers configured (from settings files) ---"
+    # Extract mcpServers keys from settings.json and settings.local.json if they parse.
+    for f in "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json"; do
+        if [ -f "$f" ]; then
+            echo "### $(basename "$f")"
+            # Best-effort: python -c 'json' for robust parse; fall back to grep.
+            python3 -c "
+import json, sys
+try:
+    d = json.load(open('$f'))
+    servers = list((d.get('mcpServers') or {}).keys())
+    print('  mcp: ' + (', '.join(servers) if servers else '(none)'))
+except Exception as e:
+    print(f'  (could not parse: {e})')
+" 2>/dev/null || grep -o '"mcpServers"' "$f" || true
+        fi
+    done
+    echo
+
+    echo "=== END USER CONTEXT BUNDLE ==="
+} > "$CONTEXT_FILE"
+
+CONTEXT_BYTES="$(wc -c < "$CONTEXT_FILE" | tr -d ' ')"
+echo "INFO: Tier 2 context bundle: $CONTEXT_BYTES bytes"
+
+# ---- STEP 3b: Render prompt template and append context ----
 USER_NAME="$(id -F 2>/dev/null || whoami)"
 USER_WORKFLOWS="${USER_WORKFLOWS:-General software development. No specific framework preferences.}"
 
 PROMPT_FILE="$(mktemp -t claude-digest-prompt.XXXXXX)"
-trap 'rm -f "$PROMPT_FILE"' EXIT
+trap 'rm -f "$PROMPT_FILE" "$CONTEXT_FILE"' EXIT
 
-sed \
-    -e "s|__TODAY__|${TODAY}|g" \
-    -e "s|__USER_NAME__|${USER_NAME}|g" \
-    -e "s|__EMAIL__|${EMAIL}|g" \
-    -e "s|__USER_WORKFLOWS__|${USER_WORKFLOWS}|g" \
-    -e "s|__INSTALLED_VERSION__|${INSTALLED_VERSION}|g" \
-    -e "s|__CAN_UPDATE__|${CAN_UPDATE}|g" \
-    -e "s|__INSTALL_DIR__|${INSTALL_DIR}|g" \
-    -e "s|__CLAUDE_BIN__|${CLAUDE_BIN}|g" \
-    "$PROMPT_TPL" > "$PROMPT_FILE"
+# We use python for substitution instead of sed: macOS BSD sed chokes on
+# multibyte delimiters, and any pipe/slash chars in USER_WORKFLOWS would
+# break the common escapes. Python's str.replace handles everything cleanly.
+export TODAY USER_NAME EMAIL USER_WORKFLOWS INSTALLED_VERSION CAN_UPDATE INSTALL_DIR CLAUDE_BIN
+python3 - "$PROMPT_TPL" "$PROMPT_FILE" <<'PYEOF'
+import os, sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, 'r', encoding='utf-8') as f:
+    text = f.read()
+subs = {
+    '__TODAY__':             os.environ.get('TODAY', ''),
+    '__USER_NAME__':         os.environ.get('USER_NAME', ''),
+    '__EMAIL__':             os.environ.get('EMAIL', ''),
+    '__USER_WORKFLOWS__':    os.environ.get('USER_WORKFLOWS', ''),
+    '__INSTALLED_VERSION__': os.environ.get('INSTALLED_VERSION', ''),
+    '__CAN_UPDATE__':        os.environ.get('CAN_UPDATE', ''),
+    '__INSTALL_DIR__':       os.environ.get('INSTALL_DIR', ''),
+    '__CLAUDE_BIN__':        os.environ.get('CLAUDE_BIN', ''),
+}
+for placeholder, value in subs.items():
+    text = text.replace(placeholder, value)
+with open(dst, 'w', encoding='utf-8') as f:
+    f.write(text)
+PYEOF
+
+# Append the context bundle after the rendered template. The template's final
+# instruction points Claude at the bundle.
+cat "$CONTEXT_FILE" >> "$PROMPT_FILE"
 
 echo "INFO: Invoking $CLAUDE_BIN with model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT"
 
