@@ -1,0 +1,238 @@
+#!/bin/bash
+# claude-daily-digest — one-time interactive installer.
+#
+# Run from the repo root:
+#   ./setup.sh
+#
+# What this does:
+#   1. Checks prerequisites (macOS, Homebrew, claude CLI, Gmail app password).
+#   2. Installs msmtp if missing.
+#   3. Asks for your email and a one-line workflow description.
+#   4. Prompts you to generate a Gmail app password (opens the URL).
+#   5. Stores the password in the System keychain (sudo required).
+#   6. Writes ~/.msmtprc and config.env.
+#   7. Installs the LaunchAgent plist.
+#   8. Sends a test email to confirm the whole chain works.
+#
+# Safe to re-run. Will overwrite existing config with your confirmation.
+
+set -euo pipefail
+
+# ---- Colors for friendlier output ----
+if [ -t 1 ]; then
+    C_RED=$'\033[0;31m'
+    C_GRN=$'\033[0;32m'
+    C_YLW=$'\033[0;33m'
+    C_BLU=$'\033[0;34m'
+    C_BLD=$'\033[1m'
+    C_RST=$'\033[0m'
+else
+    C_RED="" C_GRN="" C_YLW="" C_BLU="" C_BLD="" C_RST=""
+fi
+
+say()  { echo "${C_BLU}==>${C_RST} $*"; }
+ok()   { echo "${C_GRN}✓${C_RST} $*"; }
+warn() { echo "${C_YLW}!${C_RST} $*"; }
+die()  { echo "${C_RED}✗ $*${C_RST}" >&2; exit 1; }
+
+# ---- Locate self ----
+INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$INSTALL_DIR"
+
+echo "${C_BLD}claude-daily-digest — installer${C_RST}"
+echo "Install directory: $INSTALL_DIR"
+echo
+
+# ---- Sanity: macOS + Homebrew ----
+if [ "$(uname)" != "Darwin" ]; then
+    die "This installer only supports macOS. For Linux, you'd need to swap launchd for a systemd timer."
+fi
+say "Checking prerequisites…"
+
+if ! command -v brew >/dev/null 2>&1; then
+    die "Homebrew not found. Install from https://brew.sh and re-run this script."
+fi
+BREW_PREFIX="$(brew --prefix)"
+ok "Homebrew at $BREW_PREFIX"
+
+# ---- Claude CLI ----
+CLAUDE_BIN="$(command -v claude || true)"
+if [ -z "$CLAUDE_BIN" ]; then
+    die "The \`claude\` CLI is not on your PATH. Install it: https://docs.claude.com/en/docs/claude-code/quickstart"
+fi
+if ! "$CLAUDE_BIN" --version >/dev/null 2>&1; then
+    die "\`claude --version\` failed. Try running \`claude\` interactively to authenticate first."
+fi
+ok "claude CLI at $CLAUDE_BIN ($("$CLAUDE_BIN" --version 2>&1 | head -1))"
+
+# ---- msmtp ----
+if ! command -v msmtp >/dev/null 2>&1; then
+    say "Installing msmtp via Homebrew…"
+    brew install msmtp
+fi
+ok "msmtp at $(command -v msmtp)"
+
+# ---- Derive names ----
+WHO="$(whoami)"
+LAUNCHD_LABEL="com.${WHO}.claude-daily-digest"
+KEYCHAIN_SERVICE="msmtp-claude-daily-digest"
+PLIST_PATH="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+
+# ---- Collect email ----
+echo
+read -r -p "Email address for the daily digest (Gmail or Google Workspace): " EMAIL
+[[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "That doesn't look like a valid email address."
+
+# ---- Collect workflow description ----
+echo
+echo "The daemon personalizes each digest based on a one-line description"
+echo "of your work. E.g. 'Backend engineer using Go, Postgres, k8s.'"
+read -r -p "One-line workflow description (press Enter for generic): " USER_WORKFLOWS
+USER_WORKFLOWS="${USER_WORKFLOWS:-General software development. No specific framework preferences.}"
+
+# ---- Gmail app password flow ----
+echo
+echo "${C_BLD}Next: Gmail app password.${C_RST}"
+echo
+echo "This is a 16-character password scoped to SMTP. It is different from your"
+echo "normal Google password. You need 2-Step Verification enabled on the account."
+echo
+echo "I'll open the app-passwords page in your browser now. Generate one named"
+echo "'claude-daily-digest' and come back."
+echo
+read -r -p "Press Enter to open the browser…" _
+open "https://myaccount.google.com/apppasswords"
+echo
+echo "When you have the 16-character password, type/paste it below (it won't be"
+echo "echoed). Spaces are fine — Google shows them for readability."
+echo
+stty -echo
+read -r -p "App password: " APP_PW
+stty echo
+echo
+APP_PW="$(echo "$APP_PW" | tr -d '[:space:]')"
+if [ "${#APP_PW}" -ne 16 ]; then
+    die "App password should be 16 characters after removing spaces. Got ${#APP_PW}."
+fi
+ok "Got a 16-character app password."
+
+# ---- Store in System keychain (sudo) ----
+echo
+say "Storing app password in System keychain (requires sudo — you'll see a password prompt)."
+# Delete any existing entry first; ignore errors if none exists.
+sudo security delete-generic-password -s "$KEYCHAIN_SERVICE" /Library/Keychains/System.keychain >/dev/null 2>&1 || true
+sudo security add-generic-password \
+    -a "$EMAIL" \
+    -s "$KEYCHAIN_SERVICE" \
+    -w "$APP_PW" \
+    /Library/Keychains/System.keychain
+unset APP_PW
+ok "Password stored in /Library/Keychains/System.keychain (service: $KEYCHAIN_SERVICE)."
+
+# ---- Write config.env ----
+CONFIG_FILE="$INSTALL_DIR/config.env"
+if [ -f "$CONFIG_FILE" ]; then
+    warn "$CONFIG_FILE already exists — overwriting."
+fi
+cat > "$CONFIG_FILE" <<EOF
+# claude-daily-digest — per-install configuration.
+# Generated by setup.sh on $(date). Safe to edit by hand.
+
+EMAIL="$EMAIL"
+INSTALL_DIR="$INSTALL_DIR"
+LAUNCHD_LABEL="$LAUNCHD_LABEL"
+KEYCHAIN_SERVICE="$KEYCHAIN_SERVICE"
+CLAUDE_BIN="$CLAUDE_BIN"
+CLAUDE_MODEL="claude-opus-4-7"
+CLAUDE_EFFORT="xhigh"
+USER_WORKFLOWS="$USER_WORKFLOWS"
+EOF
+chmod 600 "$CONFIG_FILE"
+ok "Wrote $CONFIG_FILE"
+
+# ---- Render ~/.msmtprc ----
+MSMTP_RC="$HOME/.msmtprc"
+if [ -f "$MSMTP_RC" ]; then
+    cp "$MSMTP_RC" "$MSMTP_RC.bak.$(date +%s)"
+    warn "Existing ~/.msmtprc backed up."
+fi
+sed \
+    -e "s|__EMAIL__|${EMAIL}|g" \
+    -e "s|__INSTALL_DIR__|${INSTALL_DIR}|g" \
+    -e "s|__KEYCHAIN_SERVICE__|${KEYCHAIN_SERVICE}|g" \
+    "$INSTALL_DIR/templates/msmtprc.tpl" > "$MSMTP_RC"
+chmod 600 "$MSMTP_RC"
+ok "Wrote $MSMTP_RC (mode 0600)"
+
+# ---- Render and install LaunchAgent plist ----
+mkdir -p "$HOME/Library/LaunchAgents"
+if [ -f "$PLIST_PATH" ]; then
+    warn "Existing $PLIST_PATH will be replaced (unloading first)."
+    launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || true
+fi
+sed \
+    -e "s|__LABEL__|${LAUNCHD_LABEL}|g" \
+    -e "s|__INSTALL_DIR__|${INSTALL_DIR}|g" \
+    -e "s|__HOME__|${HOME}|g" \
+    -e "s|__BREW_PREFIX__|${BREW_PREFIX}|g" \
+    "$INSTALL_DIR/templates/launchd.plist.tpl" > "$PLIST_PATH"
+ok "Wrote $PLIST_PATH"
+
+launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+ok "LaunchAgent loaded as $LAUNCHD_LABEL (fires daily at 9:03am local)."
+
+# ---- Prepare runtime directories ----
+mkdir -p "$INSTALL_DIR/logs" "$INSTALL_DIR/emails"
+[ -f "$INSTALL_DIR/INDEX.md" ] || cat > "$INSTALL_DIR/INDEX.md" <<EOF
+# Claude Code Changelog Review — Index
+
+Rolling log of every daily review. One line per run.
+
+EOF
+ok "Runtime directories ready."
+
+# ---- Test send ----
+echo
+say "Sending a test email to confirm the SMTP chain works…"
+TEST_EML="$INSTALL_DIR/emails/setup-test-$(date +%s).eml"
+cat > "$TEST_EML" <<EOF
+To: $EMAIL
+From: Claude Daily Digest <$EMAIL>
+Subject: claude-daily-digest setup — test email
+Date: $(date -R 2>/dev/null || date "+%a, %d %b %Y %H:%M:%S %z")
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Setup succeeded. Your first real digest arrives tomorrow at ~9:03am local time.
+
+Install directory: $INSTALL_DIR
+LaunchAgent:       $LAUNCHD_LABEL
+Config:            $CONFIG_FILE
+
+Safe to delete this email.
+EOF
+
+if msmtp -a gmail -t < "$TEST_EML"; then
+    ok "Test email sent. Check your inbox at $EMAIL."
+    rm -f "$TEST_EML"
+else
+    warn "msmtp send failed. The .eml is at $TEST_EML for inspection."
+    warn "Common causes: wrong app password, 2SV not enabled, or Gmail SMTP blocked by Workspace admin."
+    warn "See logs at $INSTALL_DIR/logs/msmtp.log"
+    exit 1
+fi
+
+echo
+echo "${C_GRN}${C_BLD}All done.${C_RST}"
+echo
+echo "What happens next:"
+echo "  • Tomorrow at 9:03am local (or the next wake), the daemon runs automatically."
+echo "  • Logs:        $INSTALL_DIR/logs/"
+echo "  • Digests:     $INSTALL_DIR/YYYY-MM-DD.md"
+echo "  • Sent emails: $INSTALL_DIR/emails/YYYY-MM-DD.eml"
+echo
+echo "To trigger a run right now:"
+echo "  ${C_BLD}launchctl kickstart -k gui/\$(id -u)/$LAUNCHD_LABEL${C_RST}"
+echo
+echo "To uninstall:"
+echo "  ${C_BLD}./uninstall.sh${C_RST}"
