@@ -29,9 +29,11 @@
     <!-- launchd runs this job as soon as the Mac wakes up if the 9:03
          slot was missed while the machine was asleep. Native behavior. -->
 
-    <!-- 15 minute wall clock limit. -->
+    <!-- 40 minute wall clock limit. Accommodates the 3-attempt exponential
+         backoff retry loop in daily-review.sh (60s + 5min + 20min between
+         attempts). -->
     <key>ExitTimeOut</key>
-    <integer>900</integer>
+    <integer>2400</integer>
 
     <!-- Environment: inherit PATH so `claude` and helpers resolve. -->
     <key>EnvironmentVariables</key>
