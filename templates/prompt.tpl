@@ -19,8 +19,17 @@ Read the USER CONTEXT BUNDLE appended at the end of this prompt. It contains:
 - His live MCP server status (transport, endpoint, health)
 - The last 14 days of your own prior digests (so you see what you've already said)
 
-You have license to use all of it. Name specific skills, projects, and rules
-when they apply. Quote your own past recommendations if they're relevant.
+You have license to use all of it. Name specific skills and rules when they
+apply. Quote your own past recommendations if they're relevant.
+
+Do NOT name specific products/projects from the project-folder list or from
+his workflow description unless the feature today genuinely maps to one of
+them AND you have independent evidence (from his live config, an active
+skill, or a prior digest he validated) that it's currently active. The
+project-folder list is an inventory, not a priority signal — many folders
+are stale experiments, completed client work, or long-dormant. Ground
+recommendations in workflows (GSD, design pipeline, harvest suite) and
+tooling (skills, MCP servers, settings), not in product names.
 
 User workflow (stable, his description): __USER_WORKFLOWS__
 

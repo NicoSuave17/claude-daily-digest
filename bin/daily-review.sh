@@ -218,9 +218,13 @@ trap 'rm -f "$CONTEXT_FILE" "${CONTEXT_FILE%.ctx}"' EXIT
     fi
     echo
 
-    echo "--- top-level projects (folder names only; for topical correlation) ---"
+    echo "--- recently active projects (modified in last 7 days; topical signal only) ---"
+    # Only folders modified in the last 7 days. This is a weak signal of what
+    # the user is actually touching this week — NOT a list of his portfolio.
+    # Digests should not name these projects unless the changelog item maps
+    # specifically to one of them (per the template's grounding rules).
     if [ -d "$HOME/Desktop/Projects" ]; then
-        ls -1 "$HOME/Desktop/Projects" 2>/dev/null | head -100
+        find "$HOME/Desktop/Projects" -maxdepth 1 -mindepth 1 -type d -mtime -7 -exec basename {} \; 2>/dev/null | sort | head -20
     else
         echo "(no ~/Desktop/Projects directory)"
     fi
@@ -248,7 +252,7 @@ trap 'rm -f "$CONTEXT_FILE" "${CONTEXT_FILE%.ctx}"' EXIT
     #
     # See `/Users/nicomarino/.claude/plans/can-you-review-this-goofy-hippo.md`
     # for the audit that motivated this tiering.
-    echo "# Last 3 digests in full (most recent first):"
+    echo "# Last 1 digest in full (most recent):"
     COUNT=0
     for md in $(find "$INSTALL_DIR" -maxdepth 1 -type f -name '????-??-??.md' 2>/dev/null | sort -r); do
         [ -f "$md" ] || continue
@@ -259,16 +263,16 @@ trap 'rm -f "$CONTEXT_FILE" "${CONTEXT_FILE%.ctx}"' EXIT
         cat "$md"
         echo
         COUNT=$((COUNT + 1))
-        [ "$COUNT" -ge 3 ] && break
+        [ "$COUNT" -ge 1 ] && break
     done
     [ "$COUNT" -eq 0 ] && echo "(no previous digests — this may be the first run)"
     echo
     echo "# Older digests — one-liner summaries from INDEX.md (for continuity, not detail):"
     if [ -f "$INDEX_FILE" ]; then
-        # Print INDEX lines that refer to dated digests, skipping the 3 most
+        # Print INDEX lines that refer to dated digests, skipping the 1 most
         # recent (already inlined in full above) and today's line (not written yet).
         SKIP_DATES=()
-        for md in $(find "$INSTALL_DIR" -maxdepth 1 -type f -name '????-??-??.md' 2>/dev/null | sort -r | head -3); do
+        for md in $(find "$INSTALL_DIR" -maxdepth 1 -type f -name '????-??-??.md' 2>/dev/null | sort -r | head -1); do
             SKIP_DATES+=("$(basename "$md" .md)")
         done
         SKIP_DATES+=("$TODAY")
